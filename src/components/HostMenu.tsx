@@ -21,6 +21,7 @@ export function HostMenu({ host }: { host: Host }) {
   const [copied, setCopied] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmText, setConfirmText] = useState("");
+  const [copiedUninstall, setCopiedUninstall] = useState(false);
 
   const installUrl =
     typeof window !== "undefined" ? `${window.location.origin}/api/install/${host.id}` : "";
@@ -28,6 +29,11 @@ export function HostMenu({ host }: { host: Host }) {
     host.os_type === "windows"
       ? `iwr -useb ${installUrl} | iex`
       : `curl -sSL ${installUrl} | sudo bash`;
+  // Mirror what the install scripts wrote: stop the service, remove install
+  // dir, env file, log, and (where applicable) tell the service manager to
+  // forget the unit. Safe to run multiple times — every command is `|| true`
+  // or has an idempotent flag.
+  const uninstallLiner = buildUninstallCommand(host.os_type);
 
   function reset() {
     setConfirmDelete(false);
@@ -35,6 +41,7 @@ export function HostMenu({ host }: { host: Host }) {
     setError(null);
     setName(host.name ?? "");
     setCopied(false);
+    setCopiedUninstall(false);
   }
 
   async function rename() {
@@ -68,6 +75,12 @@ export function HostMenu({ host }: { host: Host }) {
     await navigator.clipboard.writeText(oneLiner);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
+  }
+
+  async function copyUninstall() {
+    await navigator.clipboard.writeText(uninstallLiner);
+    setCopiedUninstall(true);
+    setTimeout(() => setCopiedUninstall(false), 1500);
   }
 
   return (
@@ -124,6 +137,27 @@ export function HostMenu({ host }: { host: Host }) {
             </p>
           </div>
 
+          <div className="space-y-1.5">
+            <Label>Uninstall command</Label>
+            <div className="rounded-md border bg-secondary/40 p-3 font-mono text-xs break-all relative">
+              <pre className="whitespace-pre-wrap">{uninstallLiner}</pre>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="absolute right-1 top-1"
+                onClick={copyUninstall}
+                aria-label="Copy uninstall command"
+              >
+                {copiedUninstall ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Stops the service and removes the agent files. Run on the host itself.
+              Deleting the host below removes its metrics from the dashboard but does
+              <em> not</em> stop a running agent — uninstall first.
+            </p>
+          </div>
+
           {error && <p className="text-sm text-destructive">{error}</p>}
 
           <div className="border-t pt-4">
@@ -171,4 +205,36 @@ export function HostMenu({ host }: { host: Host }) {
       </DialogContent>
     </Dialog>
   );
+}
+
+function buildUninstallCommand(os: string): string {
+  switch (os) {
+    case "linux":
+      // systemd: stop+disable, then wipe install dir + unit, then daemon-reload
+      // so systemd forgets the unit. Each step is best-effort with `|| true`.
+      return [
+        "sudo systemctl disable --now monitor-agent.service 2>/dev/null || true",
+        "sudo rm -f /etc/systemd/system/monitor-agent.service",
+        "sudo rm -rf /opt/monitor-agent",
+        "sudo systemctl daemon-reload",
+      ].join(" && ");
+    case "macos":
+      // launchd: bootout the daemon (label form, matches the install script's
+      // service spec), then remove plist, install dir, and the log file.
+      return [
+        "sudo launchctl bootout system/com.monitor.agent 2>/dev/null || true",
+        "sudo rm -f /Library/LaunchDaemons/com.monitor.agent.plist",
+        "sudo rm -rf /usr/local/lib/monitor-agent /var/log/monitor-agent.log",
+      ].join(" && ");
+    case "windows":
+      // Run from elevated PowerShell. Stops + unregisters the scheduled task,
+      // then deletes the install folder.
+      return (
+        `Stop-ScheduledTask -TaskName MonitorAgent -ErrorAction SilentlyContinue; ` +
+        `Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false -ErrorAction SilentlyContinue; ` +
+        `Remove-Item -Recurse -Force "$env:ProgramData\\MonitorAgent" -ErrorAction SilentlyContinue`
+      );
+    default:
+      return "# Unknown OS";
+  }
 }
