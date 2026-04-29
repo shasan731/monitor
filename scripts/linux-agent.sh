@@ -151,21 +151,9 @@ ping_stats() {
 # Commands base URL is the same site as ingest, different path.
 COMMANDS_URL="${MONITOR_INGEST_URL%/api/ingest}/api/commands"
 
-# Run a traceroute and emit a JSON object: { hops:[...], target, duration_ms }.
-do_traceroute() {
-  local target="$1"
-  if ! command -v traceroute >/dev/null 2>&1; then
-    printf '{"hops":[],"target":"%s","duration_ms":0,"raw":"traceroute not installed (apt install traceroute)"}' \
-      "$(json_escape "$target")"
-    return
-  fi
-  local raw start end duration_ms hops
-  start=$(date +%s)
-  raw=$(traceroute -n -q 3 -w 1 -m 30 "$target" 2>&1 | tail -n +2)
-  end=$(date +%s)
-  duration_ms=$(( (end - start) * 1000 ))
-
-  hops=$(echo "$raw" | awk '
+# Parse the standard `traceroute` output (one row per hop, three latency probes).
+parse_traceroute_output() {
+  awk '
     BEGIN { ORS=""; first=1 }
     {
       hop = $1
@@ -188,8 +176,93 @@ do_traceroute() {
       first = 0
       printf "{\"n\":%s,\"ip\":%s,\"latencies_ms\":[%s]}", hop, ip_json, lats
     }
-  ')
-  printf '{"hops":[%s],"target":"%s","duration_ms":%d}' "$hops" "$(json_escape "$target")" "$duration_ms"
+  '
+}
+
+# Parse `tracepath` output. Tracepath emits one or two lines per hop:
+#   1?:  [LOCALHOST]                                pmtu 1500   ← skip (pmtu only)
+#   1:   192.168.1.1                                  0.456ms
+#   1:   192.168.1.1                                  0.512ms asymm 3
+#   3:   no reply
+# Output one row per hop number (first matching `N:` wins) and pad latencies
+# to a 3-element array of nulls so the dashboard renders the same shape as
+# traceroute's three-probe output.
+parse_tracepath_output() {
+  awk '
+    BEGIN { ORS=""; first=1 }
+    {
+      # Skip pmtu announcements ("1?:") — only real hop lines have $1 == "N:".
+      if ($1 !~ /^[0-9]+:$/) next
+      hop_str = $1; sub(/:$/, "", hop_str)
+      if (hop_str !~ /^[0-9]+$/) next
+      if (seen[hop_str]++) next   # dedupe asymm/pmtu repeats per hop number
+
+      if (!first) print ","
+      first = 0
+
+      if ($0 ~ /no reply/) {
+        printf "{\"n\":%s,\"ip\":null,\"latencies_ms\":[null,null,null]}", hop_str
+        next
+      }
+
+      ip = $2
+      lat = "null"
+      for (i = 3; i <= NF; i++) {
+        if ($i ~ /^[0-9]+(\.[0-9]+)?ms$/) { sub(/ms$/, "", $i); lat = $i; break }
+      }
+      gsub(/\\/, "\\\\", ip); gsub(/"/, "\\\"", ip)
+      printf "{\"n\":%s,\"ip\":\"%s\",\"latencies_ms\":[%s,null,null]}", hop_str, ip, lat
+    }
+  '
+}
+
+# Run a traceroute and emit a JSON object: { hops:[...], target, duration_ms,
+# tool, raw? }. Prefers `traceroute` when available (three-probe output is
+# richer); falls back to `tracepath` (ships in iputils on most distros).
+do_traceroute() {
+  local target="$1"
+  local has_traceroute=0 has_tracepath=0
+  command -v traceroute >/dev/null 2>&1 && has_traceroute=1
+  command -v tracepath  >/dev/null 2>&1 && has_tracepath=1
+
+  if (( has_traceroute == 0 && has_tracepath == 0 )); then
+    printf '{"hops":[],"target":"%s","duration_ms":0,"tool":"none","raw":"neither traceroute nor tracepath installed (apt install traceroute or iputils-tracepath)"}' \
+      "$(json_escape "$target")"
+    return
+  fi
+
+  local raw="" hops="" tool="" start end duration_ms
+
+  start=$(date +%s)
+  if (( has_traceroute )); then
+    tool="traceroute"
+    # Capture stderr so we can detect a hard failure ("Operation not permitted",
+    # missing capabilities, etc.) and route the user to tracepath fallback.
+    raw=$(traceroute -n -q 3 -w 1 -m 30 "$target" 2>&1 | tail -n +2)
+    hops=$(echo "$raw" | parse_traceroute_output)
+  fi
+
+  # If traceroute isn't installed OR ran but produced zero parseable hops,
+  # try tracepath. This covers both "command missing" and "ran but errored
+  # before producing any data" (raw socket perms, blocked ICMP/UDP, etc.).
+  if [[ -z "$hops" ]] && (( has_tracepath )); then
+    tool="tracepath"
+    raw=$(tracepath -n -m 30 "$target" 2>&1)
+    hops=$(echo "$raw" | parse_tracepath_output)
+  fi
+  end=$(date +%s)
+  duration_ms=$(( (end - start) * 1000 ))
+
+  if [[ -z "$hops" ]]; then
+    # Both tools ran but produced no hops — surface the raw output so the user
+    # can see the actual failure in the dashboard.
+    printf '{"hops":[],"target":"%s","duration_ms":%d,"tool":"%s","raw":"%s"}' \
+      "$(json_escape "$target")" "$duration_ms" "$tool" "$(json_escape "$raw")"
+    return
+  fi
+
+  printf '{"hops":[%s],"target":"%s","duration_ms":%d,"tool":"%s"}' \
+    "$hops" "$(json_escape "$target")" "$duration_ms" "$tool"
 }
 
 # Poll for and execute pending commands targeted at this host.

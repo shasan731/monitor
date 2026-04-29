@@ -69,6 +69,8 @@ export interface TracerouteResult {
   target: string;
   duration_ms: number;
   raw?: string;
+  /** Which tool the agent actually ran (e.g. "traceroute" | "tracepath" | "tracert" | "none"). */
+  tool?: string;
 }
 
 export interface HostCommand {

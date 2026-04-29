@@ -132,6 +132,11 @@ function ActiveCommand({ command }: { command: HostCommand }) {
         <Badge variant={variant} className="capitalize">{command.status}</Badge>
         <span className="text-muted-foreground">to</span>
         <span className="font-mono">{command.target}</span>
+        {command.result?.tool && command.result.tool !== "traceroute" && command.result.tool !== "tracert" && (
+          <span className="text-muted-foreground" title="Tool used by the agent">
+            via {command.result.tool}
+          </span>
+        )}
         {command.result?.duration_ms != null && (
           <span className="text-muted-foreground ml-auto">
             {(command.result.duration_ms / 1000).toFixed(1)}s
