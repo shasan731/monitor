@@ -264,11 +264,26 @@ select cron.schedule(
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Realtime: stream metrics + host status changes to subscribed clients.
+-- Idempotent: skip the add if the table is already a member of the publication
+-- (Supabase sometimes auto-publishes new tables, and re-runs would otherwise
+-- 42710 with "relation X is already member of publication supabase_realtime").
 -- ─────────────────────────────────────────────────────────────────────────────
 
-alter publication supabase_realtime add table public.metrics;
-alter publication supabase_realtime add table public.hosts;
-alter publication supabase_realtime add table public.host_commands;
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['metrics', 'hosts', 'host_commands'] loop
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = t
+    ) then
+      execute format('alter publication supabase_realtime add table public.%I', t);
+    end if;
+  end loop;
+end $$;
 
 -- Drop completed/failed commands after a week (don't pile up).
 create or replace function public.cleanup_old_commands()
